@@ -1,0 +1,57 @@
+# =============================================================================
+# XcellerateEQ CODEOWNERS
+# =============================================================================
+# This file defines required reviewers for specific files and directories.
+# GitHub will automatically request reviews from these owners on any PR
+# that touches the matched paths.
+#
+# IMPORTANT: Replace mike-xcellerateeq with the actual repo owner username.
+# =============================================================================
+
+# --- DEFAULT: Owner reviews everything ---
+*                                   @mike-xcellerateeq
+
+# --- CRITICAL: Authentication and Authorization ---
+/src/auth/                          @mike-xcellerateeq
+/src/middleware/auth*                @mike-xcellerateeq
+**/auth.ts                          @mike-xcellerateeq
+**/auth.js                          @mike-xcellerateeq
+**/authentication*                  @mike-xcellerateeq
+**/authorization*                   @mike-xcellerateeq
+
+# --- CRITICAL: Database and Migrations ---
+/migrations/                        @mike-xcellerateeq
+/src/db/                            @mike-xcellerateeq
+**/schema*                          @mike-xcellerateeq
+**/*.sql                            @mike-xcellerateeq
+
+# --- CRITICAL: Environment and Secrets ---
+.env*                               @mike-xcellerateeq
+**/config.ts                        @mike-xcellerateeq
+**/config.js                        @mike-xcellerateeq
+**/secrets*                         @mike-xcellerateeq
+
+# --- CRITICAL: Infrastructure and CI/CD ---
+Dockerfile*                         @mike-xcellerateeq
+docker-compose*                     @mike-xcellerateeq
+.github/workflows/                  @mike-xcellerateeq
+.github/CODEOWNERS                  @mike-xcellerateeq
+
+# --- CRITICAL: Dependencies ---
+package.json                        @mike-xcellerateeq
+package-lock.json                   @mike-xcellerateeq
+requirements.txt                    @mike-xcellerateeq
+Pipfile*                            @mike-xcellerateeq
+yarn.lock                           @mike-xcellerateeq
+
+# --- CRITICAL: API Routes and External Integrations ---
+/src/api/                           @mike-xcellerateeq
+**/zoom*                            @mike-xcellerateeq
+**/hume*                            @mike-xcellerateeq
+**/anthropic*                       @mike-xcellerateeq
+**/claude*                          @mike-xcellerateeq
+
+# --- GOVERNANCE: Core Documentation ---
+/docs/CORE_DEV*                     @mike-xcellerateeq
+/docs/governance*                   @mike-xcellerateeq
+README.md                           @mike-xcellerateeq

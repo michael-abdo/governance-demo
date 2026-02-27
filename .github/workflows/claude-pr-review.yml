@@ -1,0 +1,183 @@
+name: Claude AI PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR diff
+        id: diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr diff ${{ github.event.pull_request.number }} > pr_diff.txt
+          echo "diff_size=$(wc -c < pr_diff.txt)" >> $GITHUB_OUTPUT
+
+      - name: Check diff size
+        id: check
+        run: |
+          DIFF_SIZE=${{ steps.diff.outputs.diff_size }}
+          if [ "$DIFF_SIZE" -gt 100000 ]; then
+            echo "oversized=true" >> $GITHUB_OUTPUT
+            echo "WARNING: Diff exceeds 100KB. Truncating for review."
+            head -c 100000 pr_diff.txt > pr_diff_truncated.txt
+            mv pr_diff_truncated.txt pr_diff.txt
+          else
+            echo "oversized=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get changed file list
+        id: files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr view ${{ github.event.pull_request.number }} --json files --jq '.files[].path' > changed_files.txt
+          cat changed_files.txt
+
+      - name: Check for sensitive files
+        id: sensitive
+        run: |
+          SENSITIVE_PATTERNS="\.env|secrets|auth/|middleware/auth|migrations/|docker-compose|Dockerfile|package\.json|requirements\.txt|\.lock$|CODEOWNERS|\.github/workflows"
+          SENSITIVE_FILES=$(grep -E "$SENSITIVE_PATTERNS" changed_files.txt || true)
+          if [ -n "$SENSITIVE_FILES" ]; then
+            echo "found=true" >> $GITHUB_OUTPUT
+            echo "$SENSITIVE_FILES" > sensitive_files.txt
+            echo "SENSITIVE FILES DETECTED:"
+            cat sensitive_files.txt
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send to Claude API for review
+        id: review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          PR_BODY="${{ github.event.pull_request.body }}"
+          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
+          SENSITIVE="${{ steps.sensitive.outputs.found }}"
+          OVERSIZED="${{ steps.check.outputs.oversized }}"
+
+          SENSITIVE_NOTE=""
+          if [ "$SENSITIVE" = "true" ]; then
+            SENSITIVE_FILES=$(cat sensitive_files.txt)
+            SENSITIVE_NOTE="CRITICAL: This PR touches sensitive files that require owner review: ${SENSITIVE_FILES}"
+          fi
+
+          OVERSIZE_NOTE=""
+          if [ "$OVERSIZED" = "true" ]; then
+            OVERSIZE_NOTE="WARNING: This diff was truncated because it exceeds 100KB. The review may be incomplete. Consider breaking this PR into smaller pieces."
+          fi
+
+          DIFF_CONTENT=$(cat pr_diff.txt)
+          CHANGED_FILES=$(cat changed_files.txt)
+
+          # Build the JSON payload
+          jq -n \
+            --arg model "claude-sonnet-4-5-20250929" \
+            --arg system "You are a senior code reviewer for XcellerateEQ, an AI-powered meeting analytics platform. Your job is to review pull request diffs and provide actionable, specific feedback.
+
+          REVIEW PRIORITIES (in order):
+          1. SECURITY: Hardcoded secrets, SQL injection, XSS, auth bypasses, data exposure
+          2. ARCHITECTURE: Does this align with the existing codebase patterns? Any unnecessary complexity?
+          3. DATA INTEGRITY: Database migrations, data loss risks, race conditions
+          4. LOGIC ERRORS: Off-by-one, null handling, edge cases, error handling gaps
+          5. PERFORMANCE: N+1 queries, memory leaks, unnecessary re-renders
+          6. CODE QUALITY: Naming, readability, test coverage gaps
+
+          RESPONSE FORMAT:
+          Start with a severity summary: CRITICAL / WARNING / CLEAN
+          Then list findings grouped by category above.
+          For each finding, reference the specific file and line context.
+          End with a one-line verdict: APPROVE, REQUEST CHANGES, or NEEDS DISCUSSION.
+
+          If sensitive files (auth, migrations, env, dependencies) are touched, always flag them prominently.
+          Be direct. No filler. Prioritize issues by impact." \
+            --arg content "PR: ${PR_TITLE}
+          Author: ${PR_AUTHOR}
+          Description: ${PR_BODY}
+
+          ${SENSITIVE_NOTE}
+          ${OVERSIZE_NOTE}
+
+          Changed files:
+          ${CHANGED_FILES}
+
+          Diff:
+          ${DIFF_CONTENT}" \
+            '{
+              model: $model,
+              max_tokens: 4096,
+              system: $system,
+              messages: [{role: "user", content: $content}]
+            }' > payload.json
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            https://api.anthropic.com/v1/messages \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+            -H "anthropic-version: 2023-06-01" \
+            -d @payload.json)
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "API call failed with status $HTTP_CODE"
+            echo "$BODY"
+            echo "review_text=Claude API review failed (HTTP $HTTP_CODE). Manual review required." >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          REVIEW_TEXT=$(echo "$BODY" | jq -r '.content[0].text')
+          # Save to file to avoid shell escaping issues
+          echo "$REVIEW_TEXT" > review_output.txt
+
+      - name: Post review comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SENSITIVE="${{ steps.sensitive.outputs.found }}"
+          HEADER="## Claude AI Code Review"
+          FOOTER="---
+          *Automated review by Claude API. This does not replace human review.*"
+
+          SENSITIVE_BANNER=""
+          if [ "$SENSITIVE" = "true" ]; then
+            SENSITIVE_BANNER="
+          > **SENSITIVE FILES DETECTED** - This PR touches auth, migrations, dependencies, or infrastructure files. Owner approval is REQUIRED before merge.
+          "
+          fi
+
+          REVIEW_BODY=$(cat review_output.txt)
+          COMMENT="${HEADER}
+          ${SENSITIVE_BANNER}
+
+          ${REVIEW_BODY}
+
+          ${FOOTER}"
+
+          echo "$COMMENT" > comment.md
+          gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
+
+      - name: Request owner review for sensitive files
+        if: steps.sensitive.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr edit ${{ github.event.pull_request.number }} --add-label "requires-owner-review"
+          # Request review from repo owner (update with your GitHub username)
+          gh pr edit ${{ github.event.pull_request.number }} --add-reviewer "${{ github.repository_owner }}"
