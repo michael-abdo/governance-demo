@@ -65,27 +65,30 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          PR_TITLE="${{ github.event.pull_request.title }}"
-          PR_BODY="${{ github.event.pull_request.body }}"
-          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
-          SENSITIVE="${{ steps.sensitive.outputs.found }}"
-          OVERSIZED="${{ steps.check.outputs.oversized }}"
+          # Build user message content safely via file (avoids shell injection from diff content)
+          {
+            printf "PR: %s\n" "${{ github.event.pull_request.title }}"
+            printf "Author: %s\n" "${{ github.event.pull_request.user.login }}"
+            printf "Description: %s\n" "${{ github.event.pull_request.body }}"
+          } > user_message.txt
 
-          SENSITIVE_NOTE=""
-          if [ "$SENSITIVE" = "true" ]; then
-            SENSITIVE_FILES=$(cat sensitive_files.txt)
-            SENSITIVE_NOTE="CRITICAL: This PR touches sensitive files that require owner review: ${SENSITIVE_FILES}"
+          # Append sensitive file warning if needed
+          if [ "${{ steps.sensitive.outputs.found }}" = "true" ]; then
+            printf "\nCRITICAL: This PR touches sensitive files that require owner review:\n" >> user_message.txt
+            cat sensitive_files.txt >> user_message.txt
           fi
 
-          OVERSIZE_NOTE=""
-          if [ "$OVERSIZED" = "true" ]; then
-            OVERSIZE_NOTE="WARNING: This diff was truncated because it exceeds 100KB. The review may be incomplete. Consider breaking this PR into smaller pieces."
+          if [ "${{ steps.check.outputs.oversized }}" = "true" ]; then
+            printf "\nWARNING: This diff was truncated because it exceeds 100KB. The review may be incomplete.\n" >> user_message.txt
           fi
 
-          DIFF_CONTENT=$(cat pr_diff.txt)
-          CHANGED_FILES=$(cat changed_files.txt)
+          printf "\nChanged files:\n" >> user_message.txt
+          cat changed_files.txt >> user_message.txt
 
-          # Build the JSON payload
+          printf "\nDiff:\n" >> user_message.txt
+          cat pr_diff.txt >> user_message.txt
+
+          # Build JSON payload using jq with --rawfile to avoid shell injection
           jq -n \
             --arg model "claude-sonnet-4-5-20250929" \
             --arg system "You are a senior code reviewer for XcellerateEQ, an AI-powered meeting analytics platform. Your job is to review pull request diffs and provide actionable, specific feedback.
@@ -106,18 +109,7 @@ jobs:
 
           If sensitive files (auth, migrations, env, dependencies) are touched, always flag them prominently.
           Be direct. No filler. Prioritize issues by impact." \
-            --arg content "PR: ${PR_TITLE}
-          Author: ${PR_AUTHOR}
-          Description: ${PR_BODY}
-
-          ${SENSITIVE_NOTE}
-          ${OVERSIZE_NOTE}
-
-          Changed files:
-          ${CHANGED_FILES}
-
-          Diff:
-          ${DIFF_CONTENT}" \
+            --rawfile content user_message.txt \
             '{
               model: $model,
               max_tokens: 4096,
@@ -138,39 +130,34 @@ jobs:
           if [ "$HTTP_CODE" != "200" ]; then
             echo "API call failed with status $HTTP_CODE"
             echo "$BODY"
-            echo "review_text=Claude API review failed (HTTP $HTTP_CODE). Manual review required." >> $GITHUB_OUTPUT
-            exit 0
+            echo "Claude API review failed (HTTP $HTTP_CODE). Manual review required." > review_output.txt
+          else
+            echo "$BODY" | jq -r '.content[0].text' > review_output.txt
           fi
-
-          REVIEW_TEXT=$(echo "$BODY" | jq -r '.content[0].text')
-          # Save to file to avoid shell escaping issues
-          echo "$REVIEW_TEXT" > review_output.txt
 
       - name: Post review comment
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           SENSITIVE="${{ steps.sensitive.outputs.found }}"
-          HEADER="## Claude AI Code Review"
-          FOOTER="---
-          *Automated review by Claude API. This does not replace human review.*"
-
           SENSITIVE_BANNER=""
           if [ "$SENSITIVE" = "true" ]; then
-            SENSITIVE_BANNER="
-          > **SENSITIVE FILES DETECTED** - This PR touches auth, migrations, dependencies, or infrastructure files. Owner approval is REQUIRED before merge.
-          "
+            SENSITIVE_BANNER="> **SENSITIVE FILES DETECTED** - This PR touches auth, migrations, dependencies, or infrastructure files. Owner approval is REQUIRED before merge."
           fi
 
-          REVIEW_BODY=$(cat review_output.txt)
-          COMMENT="${HEADER}
-          ${SENSITIVE_BANNER}
+          {
+            echo "## Claude AI Code Review"
+            echo ""
+            if [ -n "$SENSITIVE_BANNER" ]; then
+              echo "$SENSITIVE_BANNER"
+              echo ""
+            fi
+            cat review_output.txt
+            echo ""
+            echo "---"
+            echo "*Automated review by Claude API. This does not replace human review.*"
+          } > comment.md
 
-          ${REVIEW_BODY}
-
-          ${FOOTER}"
-
-          echo "$COMMENT" > comment.md
           gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
 
       - name: Request owner review for sensitive files
@@ -179,5 +166,4 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh pr edit ${{ github.event.pull_request.number }} --add-label "requires-owner-review"
-          # Request review from repo owner (update with your GitHub username)
           gh pr edit ${{ github.event.pull_request.number }} --add-reviewer "${{ github.repository_owner }}"
